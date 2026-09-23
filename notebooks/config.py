@@ -13,17 +13,15 @@ CATALOG = "jgworkspaceclassic_catalog"
 WORK_SCHEMA = "prueba_izzi"
 
 # ── Origen de datos ──────────────────────────────────────────
-# Ruta base donde están los datos del workshop.
+# Ruta donde viven los JSONL preprocesados de Kentik (1.5M+ registros).
+# Generados a partir de los archivos JSON concatenados originales
+# (preprocesamiento: arrays JSON → JSONL).
 # Spark lee igual de un Volume, S3, ADLS o GCS — solo cambia la ruta.
-# Ejemplos:
-#   Volume UC:  "/Volumes/mi_catalogo/mi_schema/mi_volume"
-#   S3:         "s3://mi-bucket-izzi/landing/telemetria"
-# Si usas S3 necesitas un External Location en Unity Catalog.
-BASE_PATH = "/Volumes/jgworkspaceclassic_catalog/prueba_izzi/workshop"
+DATA_PATH = f"/Volumes/{CATALOG}/prueba_izzi/landing_jsonl"
 
-# Subcarpetas dentro de BASE_PATH
-RAW_SUBDIR       = "raw_jsonl"
-EVOLUTION_SUBDIR = "raw_jsonl_evolucion"
-MULTILINE_SUBDIR = "multiline_sample"
-
+# ── Datos de evolución de esquema ─────────────────────────────
+# Carpeta con JSONL que tienen columnas adicionales (collector_version, latency_ms)
+# para el ejercicio de schema evolution del lab 02.
+# s3://pocdatabricksizzi/workshop/jsons_otro_esquema/
+EVOLUTION_PATH = f"/Volumes/{CATALOG}/prueba_izzi/landing_jsonl_evolucion"
 

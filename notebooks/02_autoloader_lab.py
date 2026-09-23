@@ -5,11 +5,11 @@
 # ///
 # DBTITLE 1,Intro
 # MAGIC %md
-# MAGIC # 02 · Auto Loader — ingesta incremental (Día 1) 
+# MAGIC # 02 · Auto Loader — ingesta incremental de flujos Kentik (Día 1) 
 # MAGIC
 # MAGIC **Auto Loader** (`cloudFiles`) ingiere archivos nuevos de un almacenamiento de objetos de forma
 # MAGIC **incremental y con estado**: recuerda qué archivos ya procesó, así que en cada corrida solo lee lo nuevo.
-# MAGIC Es la base recomendada para la capa **bronce** a escala (en Izzi: TB/día de JSON).
+# MAGIC Es la base recomendada para la capa **bronce** a escala (en Izzi: TB/día de flujos Kentik).
 # MAGIC
 # MAGIC En este lab verás:
 # MAGIC 1. Ingesta incremental con `trigger(availableNow=True)`.
@@ -17,7 +17,12 @@
 # MAGIC 3. `cloud_files_state()` — inspeccionar qué archivos ha descubierto el checkpoint.
 # MAGIC 4. Columnas de **linaje** (`_metadata`) para trazabilidad en producción.
 # MAGIC 5. `file notification` vs `directory listing` + **throttling** (`maxFilesPerTrigger`, `maxBytesPerTrigger`).
-# MAGIC 6. Inferencia de esquema vs **esquema explícito** (~10% más rápido).
+# MAGIC 6. **Archivos corruptos** — qué pasa cuando llega un archivo inválido.
+# MAGIC 7. **Schema evolution** — qué pasa cuando el origen agrega campos nuevos.
+# MAGIC
+# MAGIC > 💡 Todos los Auto Loaders de este lab usan **esquema explícito** (`.schema(...)`).
+# MAGIC > También existe `inferColumnTypes=true` que detecta tipos automáticamente, pero es
+# MAGIC > ~10% más lento por el paso adicional de inferencia. En producción siempre esquema fijo.
 
 # COMMAND ----------
 
@@ -27,37 +32,67 @@
 
 # MAGIC %md
 # MAGIC ## 1. Primera ingesta incremental
-# MAGIC Leemos los JSON del Volume con `cloudFiles` y escribimos a una tabla bronce.
+# MAGIC Leemos **todos** los JSONL preprocesados (1.5M+ flujos reales) con `cloudFiles` y escribimos a una tabla bronce.
 # MAGIC `availableNow=True` procesa todo lo disponible y **se detiene** (ideal para batch/incremental programado).
 # MAGIC `_rescued_data` captura columnas que no calzan con el esquema (nunca pierdes datos).
+# MAGIC
+# MAGIC > ⚠️ Los JSONL originales de Kentik contienen campos `custom_str`, `custom_int`, `custom_bigint`
+# MAGIC > con nombres de campo que tienen caracteres especiales (`/`, `()`). El esquema explícito los
+# MAGIC > declara como `MAP<STRING, ...>` en vez de `STRUCT`, evitando errores de nombres inválidos en Delta.
 
 # COMMAND ----------
 
-bronze = tbl("bronze_autoloader")
-chk = f"{CHK_PATH}/bronze_autoloader"
-schema_loc = f"{CHK_PATH}/bronze_autoloader_schema"
+bronze = tbl("bronze_flujos")
+chk = f"{CHK_PATH}/bronze_flujos"
+schema_loc = f"{CHK_PATH}/bronze_flujos_schema"
+
+# Esquema explícito: ~10% más rápido que inferencia 
+from pyspark.sql.types import StructType, StructField, StringType, LongType, MapType
+
+EXPLICIT = StructType([
+    StructField("timestamp", LongType()),
+    StructField("protocol", StringType()),
+    StructField("src_addr", StringType()),
+    StructField("dst_addr", StringType()),
+    StructField("l4_src_port", LongType()),
+    StructField("l4_dst_port", LongType()),
+    StructField("in_bytes", LongType()),
+    StructField("in_pkts", LongType()),
+    StructField("out_bytes", LongType()),
+    StructField("out_pkts", LongType()),
+    StructField("src_as", LongType()),
+    StructField("dst_as", LongType()),
+    StructField("src_geo", StringType()),
+    StructField("dst_geo", StringType()),
+    StructField("device_name", StringType()),
+    StructField("device_id", LongType()),
+    StructField("sample_rate", LongType()),
+    StructField("eventType", StringType()),
+    StructField("provider", StringType()),
+    StructField("custom_str", MapType(StringType(), StringType())),
+    StructField("custom_int", MapType(StringType(), LongType())),
+    StructField("custom_bigint", MapType(StringType(), LongType())),
+])
 
 # limpieza para poder re-ejecutar el lab desde cero
 spark.sql(f"DROP TABLE IF EXISTS {bronze}")
-dbutils.fs.rm(chk, True); dbutils.fs.rm(schema_loc, True)
+dbutils.fs.rm(chk, True); 
+dbutils.fs.rm(schema_loc, True)
 
-(spark.readStream
+q = (spark.readStream
    .format("cloudFiles")
    .option("cloudFiles.format", "json")
    .option("cloudFiles.schemaLocation", schema_loc)
-   .option("cloudFiles.inferColumnTypes", "true")
+   .schema(EXPLICIT)
    .option("rescuedDataColumn", "_rescued_data")
-   .load(RAW_PATH)
+   .load(DATA_PATH) 
  .writeStream
    .option("checkpointLocation", chk)
    .trigger(availableNow=True)
    .toTable(bronze))
+q.awaitTermination()
 
-# esperar a que el micro-batch termine
-for s in spark.streams.active:
-    s.awaitTermination()
-
-print(f"Bronce: {spark.table(bronze).count():,} filas")
+print(f"Bronce: {spark.table(bronze).count():,} flujos")
 
 # COMMAND ----------
 
@@ -70,14 +105,14 @@ print(f"Bronce: {spark.table(bronze).count():,} filas")
 
 before = spark.table(bronze).count()
 
-(spark.readStream.format("cloudFiles")
+q = (spark.readStream.format("cloudFiles")
    .option("cloudFiles.format", "json")
    .option("cloudFiles.schemaLocation", schema_loc)
-   .option("cloudFiles.inferColumnTypes", "true")
+   .schema(EXPLICIT)
    .option("rescuedDataColumn", "_rescued_data")
-   .load(RAW_PATH)
+   .load(DATA_PATH)
  .writeStream.option("checkpointLocation", chk).trigger(availableNow=True).toTable(bronze))
-for s in spark.streams.active: s.awaitTermination()
+q.awaitTermination()
 
 print(f"Antes: {before:,}  |  Después: {spark.table(bronze).count():,}  (sin cambios = incremental OK)")
 
@@ -94,7 +129,7 @@ print(f"Antes: {before:,}  |  Después: {spark.table(bronze).count():,}  (sin ca
 
 # DBTITLE 1,cloud_files_state query
 df_state = spark.sql(f"""
-    SELECT path, size, create_time, discovery_time, commit_time
+    SELECT path, size, create_time, discovery_time, processed_time
     FROM cloud_files_state('{chk}')
     ORDER BY discovery_time DESC
 """)
@@ -108,7 +143,7 @@ display(df_state)
 # MAGIC %md
 # MAGIC ### 2c. Columnas de linaje con `_metadata` — trazabilidad en producción
 # MAGIC Auto Loader expone el struct `_metadata` con información del archivo fuente. En producción
-# MAGIC (Izzi: TB/día) **siempre** incluir al menos `file_path` y `file_modification_time` en bronze
+# MAGIC (Izzi: TB/día de flujos) **siempre** incluir al menos `file_path` y `file_modification_time` en bronze
 # MAGIC para saber de qué archivo vino cada registro.
 # MAGIC
 # MAGIC | Campo | Tipo | Uso |
@@ -126,10 +161,10 @@ from pyspark.sql import functions as F
 
 df_with_meta = (
     spark.read.format("json")
-    .option("cloudFiles.inferColumnTypes", "true")
-    .load(RAW_PATH)
+    .schema(EXPLICIT)
+    .load(DATA_PATH)
     .select(
-        "event_id", "event_type", "plaza",
+        "protocol", "device_name",
         F.col("_metadata.file_path").alias("source_file_path"),
         F.col("_metadata.file_name").alias("source_file_name"),
         F.col("_metadata.file_size").alias("source_file_bytes"),
@@ -155,8 +190,7 @@ display(
 # MAGIC - **Directory listing** (default): Auto Loader lista el directorio para detectar archivos nuevos.
 # MAGIC   Simple, sin permisos extra; puede volverse lento con **millones** de archivos.
 # MAGIC - **File notification** (`cloudFiles.useNotifications=true`): usa eventos del cloud (SNS/SQS en AWS)
-# MAGIC   para enterarse de archivos nuevos sin listar. **Recomendado a escala** (caso Izzi: carpetas
-# MAGIC   `anio/mes/dia/hora/min/seg` con enorme fan-out). Requiere permisos para crear la cola de notificaciones.
+# MAGIC   para enterarse de archivos nuevos sin listar. **Recomendado a escala** . Requiere permisos para crear la cola de notificaciones.
 # MAGIC
 # MAGIC ```python
 # MAGIC .option("cloudFiles.useNotifications", "true")   # requiere setup de SNS/SQS
@@ -171,76 +205,92 @@ display(
 # MAGIC | `cloudFiles.maxBytesPerTrigger` | (ilimitado) | Máx bytes por micro-batch |
 # MAGIC | `cloudFiles.maxFileAge` | (ilimitado) | Ignora archivos más viejos que este umbral (mín 14 días si se activa) |
 # MAGIC
-# MAGIC En Izzi, con archivos de 2 GB, fijar `maxBytesPerTrigger` evita OOM en el driver.
 
 # COMMAND ----------
 
+# DBTITLE 1,Archivos corruptos - teoría
 # MAGIC %md
-# MAGIC ## 4. ⚠️ Gotcha: JSON multilínea NO es *splittable*
-# MAGIC Cuando se trabaja con **arrays JSON multilínea** (un archivo = un `[ {...}, {...} ]`),
-# MAGIC no JSON-lines. Eso obliga a `multiLine=true`, y **cada archivo se procesa por un solo core**
-# MAGIC (no se puede partir) → cuello de botella con archivos de 2 GB.
+# MAGIC ## 4. Manejo de archivos corruptos en producción 
 # MAGIC
-# MAGIC Primero, leer el array multilínea SIN la opción falla o produce basura:
+# MAGIC En producción no todos los archivos que llegan son válidos. Causas comunes:
+# MAGIC - **Archivos truncados** — transferencia interrumpida (Izzi: archivos de 2 GB via SFTP/S3)
+# MAGIC - **Formato incorrecto** — texto plano con extensión `.json`, o CSV disfrazado
+# MAGIC - **Codificación rota** — bytes inválidos que rompen el parser JSON
+# MAGIC
+# MAGIC ### Comportamiento según formato
+# MAGIC - **Parquet / Avro**: archivos corruptos causan **fail-fast** (el header binario es requerido).
+# MAGIC - **JSON (nuestro caso)**: cada línea se parsea independientemente. Líneas inválidas
+# MAGIC   **no detienen el stream** — producen filas con TODOS los campos en NULL.
+# MAGIC   Esto es peligroso: datos basura entran a bronze **sin alerta**.
+# MAGIC
+# MAGIC ### Estrategias de protección
+# MAGIC
+# MAGIC | Estrategia | Efecto | Cuándo usarla |
+# MAGIC |---|---|---|
+# MAGIC | `mode=PERMISSIVE` + `_corrupt_record` | Líneas inválidas van a una columna especial | Cuarentena a nivel de registro |
+# MAGIC | `badRecordsPath` | Registra registros problemáticos en ruta de auditoría | Debugging y trazabilidad |
+# MAGIC | `ignoreCorruptFiles=true` | Salta archivos completamente ilegibles (binarios, permisos) | Bronze tolerante a fallos |
+# MAGIC | `_rescued_data` | Columnas extra/faltantes van a columna JSON | Schema mismatch sin perder nada |
+# MAGIC
+# MAGIC **Combinación recomendada para Bronze JSON a escala:**
+# MAGIC ```python
+# MAGIC .option("ignoreCorruptFiles", "true")
+# MAGIC .option("badRecordsPath", "/ruta/auditoria")
+# MAGIC .option("rescuedDataColumn", "_rescued_data")
+# MAGIC ```
+# MAGIC
+# MAGIC Veamos qué pasa cuando un archivo con líneas no-JSON entra a la carpeta de landing.
 
 # COMMAND ----------
 
-# Sin multiLine: intenta parsear cada LÍNEA como un JSON -> filas corruptas / _corrupt_record
-df_bad = spark.read.json(MULTILINE_PATH)
-print("Sin multiLine → filas:", df_bad.count(), "| columnas:", df_bad.columns[:5])
+# DBTITLE 1,Archivo corrupto: badRecordsPath al rescate
+# Sandbox personal dentro de CHK_PATH (ya es unico por usuario/esquema).
+# No toca DATA_PATH ni el checkpoint principal = cero interferencia.
+landing_c = f"{CHK_PATH}/corrupt_demo"
+chk_c     = f"{CHK_PATH}/corrupt_chk"
+sloc_c    = f"{CHK_PATH}/corrupt_schema"
+bad_c     = f"{CHK_PATH}/corrupt_bad"
+for p in (landing_c, chk_c, sloc_c, bad_c): dbutils.fs.rm(p, True)
+dbutils.fs.mkdirs(landing_c)
+
+corrupt_tbl = tbl("bronze_corrupt_demo")
+spark.sql(f"DROP TABLE IF EXISTS {corrupt_tbl}")
+
+# Crear archivo corrupto (texto plano con extension .jsonl)
+with open(f"{landing_c}/archivo_corrupto.jsonl", "w") as f:
+    f.write("ESTO NO ES JSON VALIDO\n" * 50)
+print("Archivo corrupto creado (50 lineas de texto plano con extension .jsonl)")
+
+# 3. Autoloader con badRecordsPath sobre el sandbox
+q = (spark.readStream.format("cloudFiles")
+   .option("cloudFiles.format", "json")
+   .option("cloudFiles.schemaLocation", sloc_c)
+   .schema(EXPLICIT)
+   .option("rescuedDataColumn", "_rescued_data")
+   .option("badRecordsPath", bad_c)
+   .load(landing_c)
+ .writeStream.option("checkpointLocation", chk_c)
+   .trigger(availableNow=True).toTable(corrupt_tbl))
+q.awaitTermination()
+
+total = spark.table(corrupt_tbl).count()
+print(f"\n50 lineas corruptas -> {total} registros en tabla")
 
 # COMMAND ----------
 
-# DBTITLE 1,multiLine=true correcto
-# Con multiLine=true: parsea el array completo correctamente
-from pyspark.sql import functions as F
-df_ok = spark.read.option("multiLine", "true").json(MULTILINE_PATH)
-print("Con multiLine=true → filas:", df_ok.count())
-df_ok.select("event_id", "event_type", F.col("network.client_ip")).show(3, truncate=False)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC **Mitigación en producción:** pedir al origen **JSON-lines (JSONL)** o añadir un paso de *landing*
-# MAGIC que explote el array en registros — recupera el paralelismo y baja el costo por TB.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Esquema explícito (≈10% más rápido)
-# MAGIC Cuando el esquema es **fijo** , declararlo evita el paso de inferencia y acelera.
-# MAGIC Con Auto Loader se pasa vía `.schema(...)` en lugar de `inferColumnTypes`.
-
-# COMMAND ----------
-
-from pyspark.sql.types import (StructType, StructField, StringType, LongType, DoubleType, IntegerType)
-
-net = StructType([StructField("client_ip", StringType()), StructField("public_ip", StringType()),
-    StructField("mac_address", StringType()), StructField("cmts_name", StringType()),
-    StructField("nas_ip", StringType()), StructField("dhcp_server", StringType()),
-    StructField("vlan", LongType()), StructField("lease_seconds", LongType())])
-equip = StructType([StructField("modem_mac", StringType()), StructField("serial", StringType()),
-    StructField("model", StringType()), StructField("firmware", StringType()), StructField("device_type", StringType())])
-subsc = StructType([StructField("subscriber_id", StringType()), StructField("plan", StringType()), StructField("account_status", StringType())])
-
-EXPLICIT = StructType([
-    StructField("event_id", StringType()), StructField("event_timestamp", StringType()),
-    StructField("event_type", StringType()), StructField("ingest_source", StringType()),
-    StructField("plaza", StringType()),
-    StructField("network", net), StructField("equipment", equip), StructField("subscriber", subsc),
-    StructField("event_date", StringType()),   # ← incluir columna de partición
-])
-
-df_expl = (spark.read.format("json").schema(EXPLICIT).option("multiLine", "false").load(RAW_PATH))
-print("Con esquema explícito → filas:", df_expl.count())
-df_expl.printSchema()
+# DBTITLE 1,Limpieza: eliminar sandbox corrupto
+# Eliminar sandbox personal completo (tabla + carpetas)
+spark.sql(f"DROP TABLE IF EXISTS {corrupt_tbl}")
+for p in (landing_c, chk_c, sloc_c, bad_c): dbutils.fs.rm(p, True)
+print("Sandbox corrupto eliminado. Nada queda en el workspace.")
 
 # COMMAND ----------
 
 # DBTITLE 1,Schema evolution intro
 # MAGIC %md
-# MAGIC ## 6. Schema evolution — cuando llega un esquema nuevo ⭐
-# MAGIC En la vida real el origen agrega campos sin avisar. Auto Loader ofrece 4 modos para manejarlo
+# MAGIC ## 5. Schema evolution — cuando llega un esquema nuevo 
+# MAGIC  Auto Loader ofrece 4 modos para manejar cambios en los esquemas de los datos
+# MAGIC
 # MAGIC vía `cloudFiles.schemaEvolutionMode`:
 # MAGIC
 # MAGIC | Modo | ¿Falla? | Comportamiento | Cuándo usarlo |
@@ -250,58 +300,87 @@ df_expl.printSchema()
 # MAGIC | **`failOnNewColumns`** | Sí | Falla y **no** agrega la columna; requiere intervención manual | Control estricto: revisar antes de aceptar cambios |
 # MAGIC | **`none`** | No | Ignora columnas nuevas silenciosamente | Esquema fijo (caso Izzi en producción) |
 # MAGIC
-# MAGIC La carpeta **`raw_jsonl_evolucion/`** tiene un archivo con **2 columnas nuevas** (`collector_version`,
-# MAGIC `latency_ms`) que NO existen en los datos base. Veamos cómo funciona el modo `rescue`.
+# MAGIC La carpeta **`_evolucion/`** tiene un archivo con **2 columnas nuevas** (`collector_version`,
+# MAGIC `latency_ms`) que NO existen en los flujos base. Veamos cómo funciona el modo `rescue`.
 # MAGIC
 # MAGIC Simulamos la llegada de archivos a **tu** carpeta de aterrizaje (writable): primero el esquema base,
 # MAGIC luego el archivo evolucionado.
 
 # COMMAND ----------
 
-# comparar los esquemas de las dos carpetas
-base_cols = set(spark.read.json(f"{RAW_PATH}/event_date=2026-08-10").columns)
+# DBTITLE 1,Comparar esquemas: base vs evolucionado
+# Antes de simular: verificar qué columnas NUEVAS trae el archivo evolucionado
+base_cols = set(spark.read.json(DATA_PATH).columns)
 evol_cols = set(spark.read.json(EVOLUTION_PATH).columns)
 print("Columnas NUEVAS en la carpeta de evolución:", sorted(evol_cols - base_cols))
 
 # COMMAND ----------
 
-# preparar carpeta de aterrizaje personal (plana) y checkpoint
-landing = f"{CHK_PATH}/landing_evol"
-chk_e = f"{CHK_PATH}/evol_stream"; sloc_e = f"{CHK_PATH}/evol_schema"
-for p in (landing, chk_e, sloc_e): dbutils.fs.rm(p, True)
+# DBTITLE 1,Lote 1: ingesta con esquema base
+# ── 1. Preparar sandbox limpio ──────────────────────────────────
+# Carpeta temporal donde simularemos la llegada de archivos.
+# Cada re-ejecución borra todo para empezar de cero.
+landing = f"{CHK_PATH}/landing_evol"        # carpeta de aterrizaje
+chk_e   = f"{CHK_PATH}/evol_stream"         # checkpoint del stream
+sloc_e  = f"{CHK_PATH}/evol_schema"         # esquema inferido
+for p in (landing, chk_e, sloc_e):
+    dbutils.fs.rm(p, True)
 dbutils.fs.mkdirs(landing)
-evol_bronze = tbl("bronze_evol")
+
+evol_bronze = tbl("bronze_flujos_evol")
 spark.sql(f"DROP TABLE IF EXISTS {evol_bronze}")
 
-# 1er archivo: esquema BASE
-dbutils.fs.cp(f"{RAW_PATH}/event_date=2026-08-10/part-000.json", f"{landing}/lote_1_base.json")
+# ── 2. Copiar el PRIMER archivo (esquema base, sin columnas nuevas) ─
+base_files = [f.path for f in dbutils.fs.ls(DATA_PATH) if f.name.endswith(".jsonl")]
+dbutils.fs.cp(base_files[0], f"{landing}/lote_1_base.json")
+print(f"Lote 1 copiado: {base_files[0].split('/')[-1]} → landing/lote_1_base.json")
 
+# ── 3. Definir el Auto Loader con modo 'rescue' ────────────────
+# NOTA: aquí usamos inferColumnTypes=true (NO esquema explícito).
+# ¿Por qué? Para que Auto Loader DETECTE las columnas nuevas del
+# archivo evolucionado. Con esquema fijo las ignoraría.
 def run_autoloader():
-    (spark.readStream.format("cloudFiles")
+    q = (spark.readStream.format("cloudFiles")
        .option("cloudFiles.format", "json")
        .option("cloudFiles.schemaLocation", sloc_e)
        .option("cloudFiles.inferColumnTypes", "true")
-       .option("cloudFiles.schemaEvolutionMode", "rescue")   # campos nuevos → _rescued_data (no falla)
+       .option("cloudFiles.schemaEvolutionMode", "rescue")
        .option("rescuedDataColumn", "_rescued_data")
        .load(landing)
-     .writeStream.option("checkpointLocation", chk_e).trigger(availableNow=True).toTable(evol_bronze))
-    for s in spark.streams.active: s.awaitTermination()
+     .writeStream
+       .option("checkpointLocation", chk_e)
+       .trigger(availableNow=True)
+       .toTable(evol_bronze))
+    q.awaitTermination()
 
+# ── 4. Ejecutar: solo el lote base ─────────────────────────────
 run_autoloader()
-print("Tras lote BASE →", spark.table(evol_bronze).count(), "filas | columnas:", "collector_version" in spark.table(evol_bronze).columns)
+
+count = spark.table(evol_bronze).count()
+has_new = "collector_version" in spark.table(evol_bronze).columns
+print(f"\nTras lote BASE → {count:,} filas")
 
 # COMMAND ----------
 
-# 2do archivo: esquema EVOLUCIONADO (con collector_version y latency_ms)
-dbutils.fs.cp(f"{EVOLUTION_PATH}/events_v2.json", f"{landing}/lote_2_evol.json")
+# DBTITLE 1,Lote 2: llega archivo con columnas nuevas
+# ── 5. Copiar el SEGUNDO archivo (esquema evolucionado: +2 columnas) ─
+dbutils.fs.cp(f"{EVOLUTION_PATH}/flows_v2.json", f"{landing}/lote_2_evol.json")
+print("Lote 2 copiado: flows_v2.json → landing/lote_2_evol.json")
+
+# ── 6. Re-ejecutar el MISMO autoloader (incremental) ───────────
+# Modo 'rescue': las columnas nuevas NO rompen el stream.
+# Se guardan como JSON en _rescued_data para análisis posterior.
 run_autoloader()
 
-# En modo 'rescue', los campos nuevos NO rompen el stream: se guardan en _rescued_data
-from pyspark.sql import functions as F
-print("Total tras lote EVOLUCIONADO:", spark.table(evol_bronze).count())
-(spark.table(evol_bronze)
+count = spark.table(evol_bronze).count()
+rescued = spark.table(evol_bronze).where("_rescued_data IS NOT NULL").count()
+print(f"Total filas: {count:,}  |  Filas con _rescued_data: {rescued}")
+print(f"Las {rescued} filas del lote 2 tienen collector_version y latency_ms en _rescued_data:\n")
+
+display(spark.table(evol_bronze)
    .where("_rescued_data IS NOT NULL")
-   .select("event_id", "_rescued_data").show(3, truncate=False))
+   .select("device_name", "protocol", "src_addr", "_rescued_data")
+   .limit(5))
 
 # COMMAND ----------
 

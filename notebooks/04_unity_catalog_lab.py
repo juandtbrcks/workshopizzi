@@ -7,9 +7,9 @@
 # MAGIC activos. En Izzi es lo que permite exponer la capa **oro** a otras herramientas de forma gobernada.
 # MAGIC
 # MAGIC En este lab: jerarquía de objetos, permisos (RBAC), `information_schema`, tags de clasificación,
-# MAGIC linaje, y (avanzado) filtros de fila / máscaras de columna para datos sensibles (PII de suscriptores).
+# MAGIC linaje, y (avanzado) filtros de fila / máscaras de columna para datos sensibles (IPs de origen/destino).
 # MAGIC
-# MAGIC > Requiere haber corrido el lab **01** (usa tu tabla `delta_eventos`).
+# MAGIC > Requiere haber corrido el lab **01** (usa tu tabla `delta_flujos`).
 
 # COMMAND ----------
 
@@ -35,14 +35,14 @@ display(spark.sql(f"SHOW TABLES IN `{CATALOG}`.`{WORK_SCHEMA}`"))
 # MAGIC ```sql
 # MAGIC GRANT USE CATALOG ON CATALOG jgworkspaceclassic_catalog TO `analistas_red`;
 # MAGIC GRANT USE SCHEMA, SELECT ON SCHEMA <tu_esquema> TO `analistas_red`;
-# MAGIC GRANT SELECT ON TABLE <tu_esquema>.gold_ip_equipment_map TO `analistas_red`;
-# MAGIC REVOKE SELECT ON TABLE <tu_esquema>.silver_network_events FROM `analistas_red`;
+# MAGIC GRANT SELECT ON TABLE <tu_esquema>.gold_traffic_summary TO `analistas_red`;
+# MAGIC REVOKE SELECT ON TABLE <tu_esquema>.silver_network_flows FROM `analistas_red`;
 # MAGIC ```
 # MAGIC Veamos los permisos actuales de tu tabla:
 
 # COMMAND ----------
 
-display(spark.sql(f"SHOW GRANTS ON TABLE {tbl('delta_eventos')}"))
+display(spark.sql(f"SHOW GRANTS ON TABLE {tbl('delta_flujos')}"))
 
 # COMMAND ----------
 
@@ -67,13 +67,14 @@ display(spark.sql(f"""
 
 # COMMAND ----------
 
-spark.sql(f"ALTER TABLE {tbl('delta_eventos')} SET TAGS ('capa' = 'demo', 'dominio' = 'red')")
-# tag de PII a nivel columna sobre el struct subscriber
-spark.sql(f"ALTER TABLE {tbl('delta_eventos')} ALTER COLUMN subscriber SET TAGS ('pii' = 'true')")
+spark.sql(f"ALTER TABLE {tbl('delta_flujos')} SET TAGS ('capa' = 'bronze', 'dominio' = 'red')")
+# tags de PII a nivel columna sobre las IPs
+spark.sql(f"ALTER TABLE {tbl('delta_flujos')} ALTER COLUMN src_addr SET TAGS ('pii' = 'true', 'sensibilidad' = 'alta')")
+spark.sql(f"ALTER TABLE {tbl('delta_flujos')} ALTER COLUMN dst_addr SET TAGS ('pii' = 'true', 'sensibilidad' = 'alta')")
 
 display(spark.sql(f"""
   SELECT tag_name, tag_value FROM `{CATALOG}`.information_schema.table_tags
-  WHERE schema_name = '{WORK_SCHEMA}' AND table_name = 'delta_eventos'
+  WHERE schema_name = '{WORK_SCHEMA}' AND table_name = 'delta_flujos'
 """))
 
 # COMMAND ----------
@@ -88,31 +89,19 @@ display(spark.sql(f"""
 # MAGIC FROM system.access.table_lineage
 # MAGIC WHERE target_table_schema = '<tu_esquema>' ORDER BY event_time DESC LIMIT 20;
 # MAGIC ```
-# MAGIC Abre tu tabla `delta_eventos` en **Catalog Explorer → Lineage** para verlo gráficamente.
+# MAGIC Abre tu tabla `delta_flujos` en **Catalog Explorer → Lineage** para verlo gráficamente.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 6. (Avanzado) Máscara de columna para PII
 # MAGIC Una **column mask** enmascara datos sensibles según quién consulta — sin duplicar la tabla.
-# MAGIC Ejemplo: enmascarar `subscriber_id` a todos salvo un grupo autorizado.
+# MAGIC Ejemplo: enmascarar `src_addr` (IP origen) a todos salvo un grupo autorizado.
 # MAGIC
 # MAGIC ```sql
-# MAGIC CREATE OR REPLACE FUNCTION <tu_esquema>.mask_sub(v STRING)
+# MAGIC CREATE OR REPLACE FUNCTION <tu_esquema>.mask_ip(v STRING)
 # MAGIC   RETURN CASE WHEN is_account_group_member('analistas_red') THEN v ELSE '***MASKED***' END;
 # MAGIC
-# MAGIC ALTER TABLE <tu_esquema>.silver_network_events
-# MAGIC   ALTER COLUMN subscriber_id SET MASK <tu_esquema>.mask_sub;
+# MAGIC ALTER TABLE <tu_esquema>.delta_flujos
+# MAGIC   ALTER COLUMN src_addr SET MASK <tu_esquema>.mask_ip;
 # MAGIC ```
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 🧪 TODO — Ejercicios
-# MAGIC 1. Consulta `information_schema.columns` para listar las columnas de `delta_eventos` y sus tipos.
-# MAGIC 2. Ponle un tag `sensibilidad='alta'` a la columna `network`.
-# MAGIC 3. (Reto) Crea la función de máscara del paso 6 sobre tu tabla y comprueba el efecto con `SELECT`.
-
-# COMMAND ----------
-
-# TODO: tu código aquí

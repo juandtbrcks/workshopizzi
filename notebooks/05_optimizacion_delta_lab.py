@@ -7,7 +7,7 @@
 # MAGIC **Liquid Clustering**, `OPTIMIZE` / compaction, **file sizing**, compresión **ZSTD**, y
 # MAGIC cómo medir todo con `DESCRIBE DETAIL`.
 # MAGIC
-# MAGIC > Requiere el lab **01** (usa tu tabla `delta_eventos`).
+# MAGIC > Requiere el lab **01** (usa tu tabla `delta_flujos`).
 
 # COMMAND ----------
 
@@ -21,7 +21,7 @@
 
 # COMMAND ----------
 
-display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}")
+display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_flujos')}")
         .select("numFiles", "sizeInBytes", "clusteringColumns"))
 
 # COMMAND ----------
@@ -31,9 +31,9 @@ display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}")
 # MAGIC ## 2. Liquid Clustering
 # MAGIC Reemplaza al particionado rígido y al `ZORDER`. Agrupa físicamente los datos por las columnas que
 # MAGIC más se filtran → menos archivos leídos (**data skipping**). En Izzi las consultas van por
-# MAGIC `client_ip`, `mac_address`, `subscriber_id`, `event_date`.
+# MAGIC `src_addr`, `device_name`, `protocol`, `src_geo`.
 # MAGIC
-# MAGIC > 💡 Abajo usamos `(plaza, event_type, event_date)` como **ejemplo didáctico** para ver el efecto.
+# MAGIC > 💡 Abajo usamos `(device_site_market, protocol, src_geo)` como **ejemplo didáctico** para ver el efecto.
 # MAGIC > En el ejercicio TODO te pedimos cambiarlo a las columnas reales de producción.
 # MAGIC
 # MAGIC ⚠️ *Gotcha*: el clustering necesita **estadísticas** en esas columnas. Deben estar entre las
@@ -41,10 +41,10 @@ display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}")
 
 # COMMAND ----------
 
-spark.sql(f"ALTER TABLE {tbl('delta_eventos')} CLUSTER BY (plaza, event_type, event_date)")
+spark.sql(f"ALTER TABLE {tbl('delta_flujos')} CLUSTER BY (device_site_market, protocol, src_geo)")
 # materializa el clustering sobre los datos existentes
-spark.sql(f"OPTIMIZE {tbl('delta_eventos')}")
-display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}").select("numFiles", "sizeInBytes", "clusteringColumns"))
+spark.sql(f"OPTIMIZE {tbl('delta_flujos')}")
+display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_flujos')}").select("numFiles", "sizeInBytes", "clusteringColumns"))
 
 # COMMAND ----------
 
@@ -55,8 +55,8 @@ display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}").select("numFiles", 
 
 # COMMAND ----------
 
-spark.sql(f"SELECT COUNT(*) FROM {tbl('delta_eventos')} WHERE plaza = 'Monterrey'").show()
-print(spark.sql(f"EXPLAIN FORMATTED SELECT COUNT(*) FROM {tbl('delta_eventos')} WHERE plaza = 'Monterrey'")
+spark.sql(f"SELECT COUNT(*) FROM {tbl('delta_flujos')} WHERE device_site_market = 'CORE_IZZI'").show()
+print(spark.sql(f"EXPLAIN FORMATTED SELECT COUNT(*) FROM {tbl('delta_flujos')} WHERE device_site_market = 'CORE_IZZI'")
       .collect()[0][0][:1500])
 
 # COMMAND ----------
@@ -65,21 +65,17 @@ print(spark.sql(f"EXPLAIN FORMATTED SELECT COUNT(*) FROM {tbl('delta_eventos')} 
 # MAGIC ## 4. Compresión ZSTD y file sizing
 # MAGIC **ZSTD** es el códec recomendado (mejor ratio y velocidad que Snappy/GZIP). Se fija por tabla.
 # MAGIC
-# MAGIC ⚠️ *Gotcha medido en Izzi (2026-09):* el **nivel** de ZSTD **NO es configurable** en el writer de
-# MAGIC Databricks (ignora `parquet.compression.codec.zstd.level`) — usa un nivel fijo afinado.
-# MAGIC No existe una capa "cold ZSTD-alto gratis" vía nivel; la palanca real de *cold* es la clase de
-# MAGIC almacenamiento del objeto (S3 Intelligent-Tiering) + compaction, no el códec.
 
 # COMMAND ----------
 
 spark.sql(f"""
-  ALTER TABLE {tbl('delta_eventos')} SET TBLPROPERTIES (
+  ALTER TABLE {tbl('delta_flujos')} SET TBLPROPERTIES (
     'delta.parquet.compression.codec' = 'zstd',
     'delta.targetFileSize' = '134217728'   -- 128 MB por archivo (buen tamaño para lectura)
   )
 """)
-spark.sql(f"OPTIMIZE {tbl('delta_eventos')}")
-display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}").select("numFiles", "sizeInBytes"))
+spark.sql(f"OPTIMIZE {tbl('delta_flujos')}")
+display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_flujos')}").select("numFiles", "sizeInBytes"))
 
 # COMMAND ----------
 
@@ -105,16 +101,3 @@ display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}").select("numFiles", 
 # MAGIC
 # MAGIC **Total lakehouse Delta ≈ 13.6% del JSON crudo.** Serverless con Photon salió ~2.5× más rápido
 # MAGIC y con costo sub-lineal (~$20/TB a escala TB). El JSON crudo es zona **efímera** (retención corta).
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 🧪 TODO — Ejercicios
-# MAGIC 1. Cambia el clustering a `(client_ip, mac_address)` y vuelve a `OPTIMIZE`. Compara `numFiles`.
-# MAGIC 2. Corre `DESCRIBE HISTORY` y localiza las operaciones `OPTIMIZE` y `CLUSTER BY`.
-# MAGIC 3. (Reto) Estima el tamaño del lakehouse para 15 días de datos reales (~300–360 TB de JSON crudo)
-# MAGIC    usando la regla de la tabla del paso 6.
-
-# COMMAND ----------
-
-# TODO: tu código aquí
