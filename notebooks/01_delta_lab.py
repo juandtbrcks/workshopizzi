@@ -3,11 +3,12 @@
 # [tool.databricks.environment]
 # environment_version = "5"
 # ///
+# DBTITLE 1,Intro
 # MAGIC %md
 # MAGIC # 01 · Tablas Delta — fundamentos (Día 1)
 # MAGIC
-# MAGIC **Objetivo:** entender Delta Lake creando tu primera tabla a partir de los eventos de red,
-# MAGIC y ver las capacidades que la diferencian de un archivo Parquet: transacciones ACID,
+# MAGIC **Objetivo:** entender Delta Lake creando tu primera tabla a partir de flujos de red reales
+# MAGIC (Kentik/KFlow), y ver las capacidades que la diferencian de un archivo Parquet: transacciones ACID,
 # MAGIC `MERGE`, *time travel* y metadatos con `DESCRIBE`.
 # MAGIC
 # MAGIC Al terminar sabrás: leer JSON, escribir una tabla Delta gestionada por Unity Catalog,
@@ -21,48 +22,49 @@
 
 # MAGIC %md
 # MAGIC ## 1. Leer los eventos JSON crudos
-# MAGIC Los datos son JSON-lines particionados por `event_date`. Leemos un día para explorar la estructura.
+# MAGIC Los datos son **flujos de red Kentik (JSONL)** — 1.5M+ registros reales.
+# MAGIC Para este lab tomamos una muestra de ~4K registros para explorar la estructura.
 
 # COMMAND ----------
 
-df_raw = spark.read.json(f"{RAW_PATH}/event_date=2026-08-10")
-print(f"Eventos del 2026-08-10: {df_raw.count():,}")
+# Leer una muestra de flujos (columnas limpias, extrae campos útiles de custom_str)
+df_raw = read_clean(limit=4000)
+print(f"Muestra de flujos: {df_raw.count():,}")
 df_raw.printSchema()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Observa el esquema **anidado** (`network`, `equipment`, `subscriber`, ...). Delta y Spark
-# MAGIC manejan structs nativamente. Veamos algunos campos aplanados con notación de punto:
+# MAGIC Observa el esquema **plano** con 35 campos de flujos IP: direcciones, puertos, protocolo,
+# MAGIC bytes/paquetes, geolocalización, dispositivo de red, ASN, etc. (25 top-level + 10 extraídos de `custom_str`).
+# MAGIC Veamos algunos campos clave:
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
 (df_raw
- .select("event_id", "event_type", "plaza",
-         F.col("network.client_ip").alias("client_ip"),
-         F.col("equipment.model").alias("modelo"),
-         F.col("subscriber.subscriber_id").alias("suscriptor"))
+ .select("device_name", "protocol",
+         "src_addr", "dst_addr",
+         "in_bytes", "src_geo", "device_site_market")
  .show(5, truncate=False))
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 2. Crear una tabla Delta gestionada
-# MAGIC Escribimos TODOS los días como una tabla Delta en **tu esquema de trabajo**. Al ser gestionada
+# MAGIC Escribimos una muestra de flujos como tabla Delta en **tu esquema de trabajo**. Al ser gestionada
 # MAGIC por Unity Catalog, su ubicación física la administra Databricks dentro del bucket configurado.
 
 # COMMAND ----------
 
-df_all = spark.read.json(RAW_PATH)   # lee las 7 particiones de fecha
+df_all = read_clean(limit=28000)  # muestra de 28K flujos
 (df_all.write
    .format("delta")
    .mode("overwrite")
    .option("overwriteSchema", "true")
-   .saveAsTable(tbl("delta_eventos")))
+   .saveAsTable(tbl("delta_flujos")))
 
-print(f"Tabla creada: {tbl('delta_eventos')}")
-spark.sql(f"SELECT COUNT(*) AS eventos FROM {tbl('delta_eventos')}").show()
+print(f"Tabla creada: {tbl('delta_flujos')}")
+spark.sql(f"SELECT COUNT(*) AS flujos FROM {tbl('delta_flujos')}").show()
 
 # COMMAND ----------
 
@@ -72,49 +74,43 @@ spark.sql(f"SELECT COUNT(*) AS eventos FROM {tbl('delta_eventos')}").show()
 
 # COMMAND ----------
 
-display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_eventos')}"))
+display(spark.sql(f"DESCRIBE DETAIL {tbl('delta_flujos')}"))
 
 # COMMAND ----------
 
 # DBTITLE 1,MERGE contexto
 # MAGIC %md
 # MAGIC ## 4. Transacciones: `MERGE` (upsert)
-# MAGIC Simulamos una corrección: marcar como `inactive` la cuenta de un suscriptor.
+# MAGIC Simulamos una corrección: actualizar el `device_site_market` de un dispositivo (p. ej. una reclasificación de zona).
 # MAGIC `MERGE` aplica cambios de forma atómica (ACID) — algo imposible con Parquet plano.
 # MAGIC
-# MAGIC > ⚠️ Delta no permite actualizar campos **dentro** de un struct anidado directamente.
-# MAGIC > Usamos `named_struct(...)` para reconstruir el struct completo con el campo modificado.
-# MAGIC
-# MAGIC Primero, un suscriptor con eventos:
+# MAGIC Primero, un dispositivo con muchos flujos:
 
 # COMMAND ----------
 
-sample_sub = spark.sql(f"""
-  SELECT subscriber.subscriber_id AS sid, COUNT(*) c
-  FROM {tbl('delta_eventos')} GROUP BY 1 ORDER BY c DESC LIMIT 1
-""").collect()[0][0]
-print("Suscriptor de ejemplo:", sample_sub)
+sample_dev = spark.sql(f"""
+  SELECT device_name, device_site_market, COUNT(*) c
+  FROM {tbl('delta_flujos')} GROUP BY 1, 2 ORDER BY c DESC LIMIT 1
+""").collect()[0]
+print(f"Dispositivo de ejemplo: {sample_dev['device_name']} (zona: {sample_dev['device_site_market']})")
 
 # COMMAND ----------
 
 # DBTITLE 1,MERGE con named_struct
-# Reconstruimos el struct 'subscriber' con named_struct para cambiar account_status
-# (Delta no permite UPDATE directo sobre campos anidados dentro de un struct)
+# MERGE: reclasificar el device_site_market del dispositivo de ejemplo
+new_zone = "Zona Reclasificada"
 spark.sql(f"""
-  MERGE INTO {tbl('delta_eventos')} AS t
-  USING (SELECT '{sample_sub}' AS sid) AS u
-  ON t.subscriber.subscriber_id = u.sid
-  WHEN MATCHED THEN UPDATE SET
-    t.subscriber = named_struct(
-      'subscriber_id', t.subscriber.subscriber_id,
-      'plan',          t.subscriber.plan,
-      'account_status', 'inactive'
-    )
+  MERGE INTO {tbl('delta_flujos')} AS t
+  USING (SELECT '{sample_dev["device_name"]}' AS dev_name) AS u
+  ON t.device_name = u.dev_name
+  WHEN MATCHED THEN UPDATE SET t.device_site_market = '{new_zone}'
 """)
 
+# Verificar
 spark.sql(f"""
-  SELECT DISTINCT subscriber.account_status
-  FROM {tbl('delta_eventos')} WHERE subscriber.subscriber_id = '{sample_sub}'
+  SELECT DISTINCT device_site_market
+  FROM {tbl('delta_flujos')}
+  WHERE device_name = '{sample_dev["device_name"]}'
 """).show()
 
 # COMMAND ----------
@@ -125,14 +121,15 @@ spark.sql(f"""
 
 # COMMAND ----------
 
-display(spark.sql(f"DESCRIBE HISTORY {tbl('delta_eventos')}"))
+display(spark.sql(f"DESCRIBE HISTORY {tbl('delta_flujos')}"))
 
 # COMMAND ----------
 
-# La versión 0 (antes del MERGE) aún tiene el estado original:
+# La versión 0 (antes del MERGE) aún tiene la zona original:
 before = spark.sql(f"""
-  SELECT DISTINCT subscriber.account_status
-  FROM {tbl('delta_eventos')} VERSION AS OF 0
-  WHERE subscriber.subscriber_id = '{sample_sub}'
+  SELECT DISTINCT device_site_market
+  FROM {tbl('delta_flujos')} VERSION AS OF 0
+  WHERE device_name = '{sample_dev["device_name"]}'
 """)
+print("Zona ANTES del MERGE (versión 0):")
 before.show()
